@@ -1,0 +1,213 @@
+#!/usr/bin/bash
+# opencode-flatpak-wifi: run the OpenCode Flatpak with ALL its traffic over Wi-Fi,
+# while the rest of the PC keeps using ethernet. Gives it your home folder.
+set -uo pipefail
+
+APP_ID="ai.opencode.opencode"
+WIFI_IF="wlp12s0"
+NS="wifins-fp"            # own namespace, so it can run beside opencode-wifi
+VETH_HOST="vethfp-host"
+VETH_NS="vethfp-ns"
+HOST_IP="10.201.0.1"
+NS_IP="10.201.0.2"
+SUBNET="10.201.0.0/24"
+TABLE=201
+
+# Fixed paths for this machine.
+SUDO="/usr/bin/sudo"
+IP="/usr/bin/ip"
+IPTABLES="/usr/bin/iptables"
+FLATPAK="/usr/bin/flatpak"
+GCC="/usr/bin/gcc"
+ENV="/usr/bin/env"
+AWK="/usr/bin/awk"
+GREP="/usr/bin/grep"
+ID="/usr/bin/id"
+MKDIR="/usr/bin/mkdir"
+MV="/usr/bin/mv"
+RM="/usr/bin/rm"
+TEE="/usr/bin/tee"
+SYSCTL="/usr/bin/sysctl"
+SLEEP="/usr/bin/sleep"
+
+RUN_USER="boss"
+RUN_UID="$("$ID" -u "$RUN_USER")"
+RUN_HOME="/home/boss"
+FIXED_PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin"
+
+# Workaround for this kernel: it rejects linkat() of O_TMPFILE files, which
+# Flatpak/libglnx uses when writing its per-instance files. This tiny shim
+# makes openat(O_TMPFILE) fail with EOPNOTSUPP, so libglnx falls back to
+# named temporary files instead.
+SCRIPT_PATH="/home/boss/.local/bin/opencode-flatpak-wifi"
+SHIM_DIR="$RUN_HOME/.local/share/opencode-flatpak-wifi"
+SHIM_SO="$SHIM_DIR/notmpfile.so"
+
+die() { echo "opencode-flatpak-wifi: $*" >&2; read -rp "Press Enter to close..."; exit 1; }
+
+"$FLATPAK" info "$APP_ID" &>/dev/null || die "$APP_ID not installed (flatpak install flathub $APP_ID)"
+
+build_flatpak_shim() {
+  [[ -x "$GCC" ]] || die "$GCC is required to build the Flatpak workaround"
+  "$MKDIR" -p "$SHIM_DIR" || die "cannot create $SHIM_DIR"
+  local tmp="$SHIM_SO.new.$$"
+  "$GCC" -shared -fPIC -O2 -o "$tmp" -x c - -ldl <<'EOF'
+#define _GNU_SOURCE
+#include <stddef.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <errno.h>
+#include <sys/types.h>
+
+static int (*real_openat)(int, const char *, int, ...) = NULL;
+static int (*real_openat64)(int, const char *, int, ...) = NULL;
+
+__attribute__((constructor))
+static void init_openat(void)
+{
+    real_openat = dlsym(RTLD_NEXT, "openat");
+    real_openat64 = dlsym(RTLD_NEXT, "openat64");
+}
+
+int openat(int dirfd, const char *pathname, int flags, ...)
+{
+    if ((flags & O_TMPFILE) == O_TMPFILE)
+    {
+        errno = EOPNOTSUPP;
+        return -1;
+    }
+    mode_t mode = 0;
+    if ((flags & O_CREAT) != 0)
+    {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, mode_t);
+        va_end(ap);
+    }
+    if (!real_openat)
+        real_openat = dlsym(RTLD_NEXT, "openat");
+    if (!real_openat)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    return real_openat(dirfd, pathname, flags, mode);
+}
+
+int openat64(int dirfd, const char *pathname, int flags, ...)
+{
+    if ((flags & O_TMPFILE) == O_TMPFILE)
+    {
+        errno = EOPNOTSUPP;
+        return -1;
+    }
+    mode_t mode = 0;
+    if ((flags & O_CREAT) != 0)
+    {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, mode_t);
+        va_end(ap);
+    }
+    if (!real_openat64)
+        real_openat64 = dlsym(RTLD_NEXT, "openat64");
+    if (!real_openat64)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    return real_openat64(dirfd, pathname, flags, mode);
+}
+EOF
+  [[ -s "$tmp" ]] || { "$RM" -f "$tmp"; die "failed to build $SHIM_SO"; }
+  "$MV" -f "$tmp" "$SHIM_SO" || { "$RM" -f "$tmp"; die "failed to install $SHIM_SO"; }
+}
+
+if [[ ! -f "$SHIM_SO" || "$SCRIPT_PATH" -nt "$SHIM_SO" ]]; then
+  build_flatpak_shim
+fi
+
+# Electron single-instance: a copy already running on ethernet would swallow
+# this launch and the new one would close instantly.
+if "$FLATPAK" ps --columns=application | "$GREP" -qx "$APP_ID"; then
+  read -rp "OpenCode is already running outside Wi-Fi. Close it and continue? [y/N] " ans
+  [[ $ans =~ ^[Yy]$ ]] || exit 0
+  "$FLATPAK" kill "$APP_ID"; "$SLEEP" 1
+fi
+
+WIFI_GW="$("$IP" -4 route show default dev "$WIFI_IF" | "$AWK" '{print $3; exit}')"
+[[ -n "$WIFI_GW" ]] || die "no default gateway on $WIFI_IF (is Wi-Fi connected?)"
+
+"$SUDO" -v || die "sudo failed"
+
+cleanup() {
+  "$SUDO" "$IPTABLES" -t nat -D POSTROUTING -s "$SUBNET" -o "$WIFI_IF" -j MASQUERADE 2>/dev/null
+  "$SUDO" "$IPTABLES" -D FORWARD -i "$VETH_HOST" -o "$WIFI_IF" -j ACCEPT 2>/dev/null
+  "$SUDO" "$IPTABLES" -D FORWARD -i "$WIFI_IF" -o "$VETH_HOST" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+  "$SUDO" "$IP" rule del from "$SUBNET" table "$TABLE" 2>/dev/null
+  "$SUDO" "$IP" route flush table "$TABLE" 2>/dev/null
+  "$SUDO" "$IP" link del "$VETH_HOST" 2>/dev/null
+  "$SUDO" "$IP" netns del "$NS" 2>/dev/null
+  return 0
+}
+trap 'exit 130' INT TERM HUP
+trap cleanup EXIT
+cleanup   # clear leftovers from a crashed run
+
+set -e
+"$SUDO" "$MKDIR" -p "/etc/netns/$NS"
+echo "nameserver 8.8.8.8" | "$SUDO" "$TEE" "/etc/netns/$NS/resolv.conf" >/dev/null
+
+"$SUDO" "$IP" netns add "$NS"
+"$SUDO" "$IP" link add "$VETH_HOST" type veth peer name "$VETH_NS"
+"$SUDO" "$IP" link set "$VETH_NS" netns "$NS"
+"$SUDO" "$IP" addr add "$HOST_IP/24" dev "$VETH_HOST"
+"$SUDO" "$IP" link set "$VETH_HOST" up
+"$SUDO" "$IP" netns exec "$NS" "$IP" addr add "$NS_IP/24" dev "$VETH_NS"
+"$SUDO" "$IP" netns exec "$NS" "$IP" link set "$VETH_NS" up
+"$SUDO" "$IP" netns exec "$NS" "$IP" link set lo up
+"$SUDO" "$IP" netns exec "$NS" "$IP" route add default via "$HOST_IP"
+
+# Policy routing: only traffic from the namespace (10.201.0.0/24) leaves via
+# Wi-Fi. The host's main table/default route is untouched, so normal apps and
+# normal Flatpak launches keep using Ethernet.
+"$SUDO" "$IP" route add "$SUBNET" dev "$VETH_HOST" table "$TABLE"
+"$SUDO" "$IP" route add default via "$WIFI_GW" dev "$WIFI_IF" table "$TABLE"
+"$SUDO" "$IP" rule add from "$SUBNET" table "$TABLE" priority 1001
+
+"$SUDO" "$SYSCTL" -qw net.ipv4.ip_forward=1
+"$SUDO" "$SYSCTL" -qw "net.ipv4.conf.$WIFI_IF.rp_filter=2"
+"$SUDO" "$IPTABLES" -t nat -I POSTROUTING -s "$SUBNET" -o "$WIFI_IF" -j MASQUERADE
+"$SUDO" "$IPTABLES" -I FORWARD -i "$VETH_HOST" -o "$WIFI_IF" -j ACCEPT
+"$SUDO" "$IPTABLES" -I FORWARD -i "$WIFI_IF" -o "$VETH_HOST" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+set +e
+
+# Launch the Flatpak inside the namespace as you, with your desktop session.
+# --filesystem=home : read/write your home folder (this run only)
+# Add more with e.g. --filesystem=/mnt/data if your projects live elsewhere.
+"$SUDO" "$IP" netns exec "$NS" "$SUDO" -u "$RUN_USER" "$ENV" \
+  HOME="$RUN_HOME" PATH="$FIXED_PATH" LANG="${LANG:-C.UTF-8}" \
+  XDG_RUNTIME_DIR="/run/user/$RUN_UID" \
+  DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$RUN_UID/bus}" \
+  WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}" DISPLAY="${DISPLAY:-:0}" \
+  XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}" \
+  XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-Hyprland}" \
+  HYPRLAND_INSTANCE_SIGNATURE="${HYPRLAND_INSTANCE_SIGNATURE:-}" \
+  XDG_DATA_DIRS="/usr/local/share:/usr/share:/var/lib/flatpak/exports/share:$RUN_HOME/.local/share/flatpak/exports/share" \
+  LD_PRELOAD="$SHIM_SO" \
+  "$FLATPAK" run --filesystem=home "$APP_ID" "$@"
+status=$?
+
+if (( status != 0 )); then
+  echo "OpenCode exited with code $status"
+  read -rp "Press Enter to close..."
+fi
+exit "$status"
+
+# Install (fish):
+#   nano ~/.local/bin/opencode-flatpak-wifi ; chmod +x ~/.local/bin/opencode-flatpak-wifi
+# Check while it runs:
+#   sudo ip netns exec wifins-fp curl -s ifconfig.me   -> Wi-Fi public IP
+# Note: the agent's shell lives inside the Flatpak runtime, so host tools
+# (your mise node, gcc...) aren't on its PATH there.
